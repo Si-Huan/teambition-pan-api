@@ -7,61 +7,91 @@ import (
 	"fmt"
 	errors "github.com/pkg/errors"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 var BaseUrl = "https://pan.teambition.com"
 
 type Fs interface {
-	CreateFolder(ctx context.Context, parent string, name string) error
-	List(ctx context.Context, dir string) (names []Node, err error)
-	Open(ctx context.Context, path string) (io.ReadCloser, error)
-	Remove(ctx context.Context, path string) error
-	CreateFile(ctx context.Context, parent string, name string, size int64, in io.Reader) error
-	Rename(ctx context.Context, path string, newName string) error
-	Move(ctx context.Context, oldPath string, newPath string) error
+	Get(ctx context.Context, path string, kind string) (*Node, error)
+	List(ctx context.Context, path string) ([]Node, error)
+	CreateFolder(ctx context.Context, path string) (*Node, error)
+	Rename(ctx context.Context, node *Node, newName string) error
+	Move(ctx context.Context, node *Node, newPath string) error
+	Remove(ctx context.Context, node *Node) error
+	Open(ctx context.Context, node *Node, headers map[string]string) (io.ReadCloser, error)
+	CreateFile(ctx context.Context, path string, size int64, in io.Reader, overwrite bool) (*Node, error)
 }
 
 type Config struct {
-	TeambitionSessionId    string
-	TeambitionSessionIdSig string
+	Cookie string
 }
 
 func (config Config) String() string {
-	return fmt.Sprintf("Config{TeambitionSessionId: %s, TeambitionSessionIdSig: %s}", config.TeambitionSessionId, config.TeambitionSessionIdSig)
+	return fmt.Sprintf("Config{Cookie: %s}", config.Cookie)
 }
 
 type Teambition struct {
-	pathNodeCache Cache
-	config        Config
-	orgId         string
-	memberId      string
-	rootId        string
-	rootNode      Node
-	driveId       string
-	ApiBaseUrl    string
-	httpClient    *http.Client
+	folderCache Cache
+	config      Config
+	orgId       string
+	memberId    string
+	rootId      string
+	rootNode    Node
+	driveId     string
+	ApiBaseUrl  string
+	httpClient  *http.Client
+	mutex       sync.Mutex
 }
 
-func (teambition Teambition) String() string {
+func (teambition *Teambition) String() string {
 	return fmt.Sprintf("Teambition{orgId: %s, memberId: %s}", teambition.orgId, teambition.memberId)
 }
 
-func (teambition *Teambition) request(ctx context.Context, method, url string, body io.Reader) (*http.Response, error) {
+func (teambition *Teambition) request(ctx context.Context, method, url string, headers map[string]string, body io.Reader) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Cookie", fmt.Sprintf("TEAMBITION_SESSIONID=%s;TEAMBITION_SESSIONID.sig=%s", teambition.config.TeambitionSessionId, teambition.config.TeambitionSessionIdSig))
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
 	res, err2 := teambition.httpClient.Do(req)
 	if err2 != nil {
 		return nil, errors.WithStack(err2)
 	}
 	return res, nil
+}
+
+func (teambition *Teambition) jsonRequest(ctx context.Context, method, url string, body io.Reader, model interface{}) error {
+	headers := map[string]string{
+		"Content-Type": "application/json",
+		"Cookie":       teambition.config.Cookie,
+	}
+	res, err := teambition.request(ctx, method, url, headers, body)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	defer res.Body.Close()
+
+	if model != nil {
+		b, err := ioutil.ReadAll(res.Body)
+		if err != nil {
+			return errors.Wrap(err, `error reading res.Body`)
+		}
+		err = json.Unmarshal(b, &model)
+		if err != nil {
+			return errors.Wrapf(err, "error parsing model, response: %s", string(b))
+		}
+	}
+
+	return nil
 }
 
 func NewFs(ctx context.Context, config *Config) (Fs, error) {
@@ -72,38 +102,30 @@ func NewFs(ctx context.Context, config *Config) (Fs, error) {
 
 	client := &http.Client{}
 	teambition := &Teambition{
-		config:        *config,
-		ApiBaseUrl:    BaseUrl,
-		httpClient:    client,
-		pathNodeCache: cache,
+		config:      *config,
+		ApiBaseUrl:  BaseUrl,
+		httpClient:  client,
+		folderCache: cache,
 	}
 
 	// get orgId, memberId
 	{
-		res, err := teambition.request(ctx, "GET", "https://www.teambition.com/api/organizations/personal", nil)
+		var personal Personal
+		err := teambition.jsonRequest(ctx, "GET", "https://www.teambition.com/api/organizations/personal", nil, &personal)
 		if err != nil {
 			return nil, errors.Wrap(err, "error getting orgId, memberId")
 		}
-		var personal Personal
-		err = json.NewDecoder(res.Body).Decode(&personal)
-		if err != nil {
-			return nil, errors.Wrap(err, "error extracting orgId, memberId")
-		}
+
 		teambition.orgId = personal.Id
 		teambition.memberId = personal.CreatorId
-		defer res.Body.Close()
 	}
 
 	// get root parentId
 	{
-		res, err := teambition.request(ctx, "GET", fmt.Sprintf("https://pan.teambition.com/pan/api/spaces?orgId=%s&memberId=%s", teambition.orgId, teambition.memberId), nil)
 		var spaces []Space
+		err := teambition.jsonRequest(ctx, "GET", fmt.Sprintf("https://pan.teambition.com/pan/api/spaces?orgId=%s&memberId=%s", teambition.orgId, teambition.memberId), nil, &spaces)
 		if err != nil {
 			return nil, errors.Wrap(err, "error getting root parentId")
-		}
-		err = json.NewDecoder(res.Body).Decode(&spaces)
-		if err != nil {
-			return nil, errors.Wrap(err, "error extracting root parentId")
 		}
 		if len(spaces) < 1 {
 			return nil, errors.New("empty spaces")
@@ -115,22 +137,16 @@ func NewFs(ctx context.Context, config *Config) (Fs, error) {
 			Name:   "Root",
 		}
 		teambition.rootNode = *n
-		defer res.Body.Close()
 	}
 
 	// get driveId
 	{
-		res, err := teambition.request(ctx, "GET", fmt.Sprintf("https://pan.teambition.com/pan/api/orgs/%s?orgId=%s", teambition.orgId, teambition.orgId), nil)
 		var drive Drive
+		err := teambition.jsonRequest(ctx, "GET", fmt.Sprintf("https://pan.teambition.com/pan/api/orgs/%s?orgId=%s", teambition.orgId, teambition.orgId), nil, &drive)
 		if err != nil {
 			return nil, errors.Wrap(err, "error getting driveId")
 		}
-		err = json.NewDecoder(res.Body).Decode(&drive)
-		if err != nil {
-			return nil, errors.Wrap(err, "error extracting driveId")
-		}
 		teambition.driveId = drive.Data.DriveId
-		defer res.Body.Close()
 	}
 
 	return teambition, nil
@@ -138,28 +154,27 @@ func NewFs(ctx context.Context, config *Config) (Fs, error) {
 
 // https://pan.teambition.com/pan/api/nodes?orgId=&driveId=&parentId=
 func (teambition *Teambition) listNodes(ctx context.Context, node *Node) (*Nodes, error) {
-	format := "https://pan.teambition.com/pan/api/nodes?orgId=%s&driveId=%s&parentId=%s&orderDirection=asc"
-	res, err := teambition.request(ctx, "GET", fmt.Sprintf(format, teambition.orgId, teambition.driveId, node.NodeId), nil)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	defer res.Body.Close()
+	format := "https://pan.teambition.com/pan/api/nodes?limit=10000&orderBy=name&orderDirection=asc&orgId=%s&driveId=%s&parentId=%s"
 	var nodes Nodes
-	err = json.NewDecoder(res.Body).Decode(&nodes)
+	err := teambition.jsonRequest(ctx, "GET", fmt.Sprintf(format, teambition.orgId, teambition.driveId, node.NodeId), nil, &nodes)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 	return &nodes, nil
 }
 
-func (teambition *Teambition) findNameNode(ctx context.Context, node *Node, name string) (*Node, error) {
+const FolderKind = "folder"
+const FileKind = "file"
+const AnyKind = "any"
+
+func (teambition *Teambition) findNameNode(ctx context.Context, node *Node, name string, kind string) (*Node, error) {
 	nodes, err := teambition.listNodes(ctx, node)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 
 	for _, d := range nodes.Data {
-		if d.Name == name {
+		if d.Name == name && (kind == AnyKind || d.Kind == kind) {
 			return &d, nil
 		}
 	}
@@ -167,32 +182,44 @@ func (teambition *Teambition) findNameNode(ctx context.Context, node *Node, name
 	return nil, errors.Errorf(`can't find "%s" under "%s"`, name, node)
 }
 
-func (teambition *Teambition) findNode(ctx context.Context, path string) (*Node, error) {
+// path must start with "/" and must not end with "/"
+func normalizePath(s string) string {
+	separator := "/"
+	if !strings.HasPrefix(s, separator) {
+		s = separator + s
+	}
+
+	if len(s) > 1 && strings.HasSuffix(s, separator) {
+		s = s[:len(s)-1]
+	}
+	return s
+}
+
+func (teambition *Teambition) Get(ctx context.Context, path string, kind string) (*Node, error) {
+	path = normalizePath(path)
+
 	if path == "/" || path == "" {
 		return &teambition.rootNode, nil
 	}
 
 	i := strings.LastIndex(path, "/")
-	if i < 0 {
-		return nil, errors.Errorf(`can't find parent of "%s"`, path)
-	}
 	parent := path[:i]
 	name := path[i+1:]
 	if i == 0 {
-		return teambition.findNameNode(ctx, &teambition.rootNode, name)
+		return teambition.findNameNode(ctx, &teambition.rootNode, name, kind)
 	}
 
-	nodeId, ok := teambition.pathNodeCache.Get(parent)
+	nodeId, ok := teambition.folderCache.Get(parent)
 	if !ok {
-		node, err := teambition.findNode(ctx, parent)
+		node, err := teambition.Get(ctx, parent, FolderKind)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
 		nodeId = node.NodeId
-		teambition.pathNodeCache.Put(parent, nodeId)
+		teambition.folderCache.Put(parent, nodeId)
 	}
 
-	return teambition.findNameNode(ctx, &Node{NodeId: nodeId}, name)
+	return teambition.findNameNode(ctx, &Node{NodeId: nodeId}, name, kind)
 }
 
 func findNodeError(err error, path string) error {
@@ -203,15 +230,11 @@ func marshalError(err error) error {
 	return errors.Wrap(err, "error marshalling body")
 }
 
-func decodeError(err error) error {
-	return errors.Wrap(err, "error decoding response")
-}
-
-func (teambition *Teambition) List(ctx context.Context, folder string) ([]Node, error) {
-	path := strings.TrimSuffix(folder, "/")
-	node, err := teambition.findNode(ctx, path)
+func (teambition *Teambition) List(ctx context.Context, path string) ([]Node, error) {
+	path = normalizePath(path)
+	node, err := teambition.Get(ctx, path, FolderKind)
 	if err != nil {
-		return nil, findNodeError(err, folder)
+		return nil, findNodeError(err, path)
 	}
 
 	nodes, err2 := teambition.listNodes(ctx, node)
@@ -222,29 +245,18 @@ func (teambition *Teambition) List(ctx context.Context, folder string) ([]Node, 
 	return nodes.Data, nil
 }
 
-func (teambition *Teambition) Open(ctx context.Context, path string) (io.ReadCloser, error) {
-	node, err := teambition.findNode(ctx, path)
-	if err != nil {
-		return nil, findNodeError(err, path)
+func (teambition *Teambition) createFolderInternal(ctx context.Context, parent string, name string) (*Node, error) {
+	teambition.mutex.Lock()
+	defer teambition.mutex.Unlock()
+
+	node, err := teambition.Get(ctx, parent+"/"+name, FolderKind)
+	if err == nil {
+		return node, nil
 	}
 
-	downloadUrl := node.DownloadUrl
-	if downloadUrl == "" {
-		return nil, errors.Errorf(`error getting downloadUrl of "%s"`, node)
-	}
-
-	res, err := teambition.request(ctx, "GET", downloadUrl, nil)
+	node, err = teambition.Get(ctx, parent, FolderKind)
 	if err != nil {
-		return nil, errors.Wrapf(err, `error downloading "%s"`, downloadUrl)
-	}
-
-	return res.Body, nil
-}
-
-func (teambition *Teambition) CreateFolder(ctx context.Context, parent string, name string) error {
-	node, err := teambition.findNode(ctx, parent)
-	if err != nil {
-		return findNodeError(err, parent)
+		return nil, findNodeError(err, parent)
 	}
 	body := map[string]string{
 		"ccpParentId":   node.NodeId,
@@ -258,24 +270,175 @@ func (teambition *Teambition) CreateFolder(ctx context.Context, parent string, n
 	}
 	b, err := json.Marshal(body)
 	if err != nil {
-		return marshalError(err)
+		return nil, marshalError(err)
 	}
-	res, err := teambition.request(ctx, "POST", "https://pan.teambition.com/pan/api/nodes/folder", bytes.NewBuffer(b))
+	var createdNode Node
+	err = teambition.jsonRequest(ctx, "POST", "https://pan.teambition.com/pan/api/nodes/folder", bytes.NewBuffer(b), createdNode)
 	if err != nil {
-		return errors.Wrap(err, "error posting create folder request")
+		return nil, errors.Wrap(err, "error posting create folder request")
 	}
-	defer res.Body.Close()
+	return &createdNode, nil
+}
+
+func (teambition *Teambition) CreateFolder(ctx context.Context, path string) (*Node, error) {
+	path = normalizePath(path)
+	pathLen := len(path)
+	i := 0
+	var createdNode *Node
+	for i < pathLen {
+		parent := path[:i]
+		remain := path[i+1:]
+		j := strings.Index(remain, "/")
+		if j < 0 {
+			// already at last position
+			return teambition.createFolderInternal(ctx, parent, remain)
+		} else {
+			node, err := teambition.createFolderInternal(ctx, parent, remain[:j])
+			if err != nil {
+				return nil, err
+			}
+			i = i + j + 1
+			createdNode = node
+		}
+	}
+
+	return createdNode, nil
+}
+
+func (teambition *Teambition) checkRoot(node *Node) error {
+	if node == nil {
+		return errors.New("empty node")
+	}
+	if node.NodeId == teambition.rootId {
+		return errors.New("can't operate on root ")
+	}
 	return nil
 }
 
-func (teambition *Teambition) CreateFile(ctx context.Context, parent string, name string, size int64, in io.Reader) error {
-	node, err := teambition.findNode(ctx, parent)
+func (teambition *Teambition) Rename(ctx context.Context, node *Node, newName string) error {
+	if err := teambition.checkRoot(node); err != nil {
+		return err
+	}
+
+	body := map[string]interface{}{
+		"orgId":     teambition.orgId,
+		"driveId":   teambition.driveId,
+		"ccpFileId": node.NodeId,
+		"name":      newName,
+	}
+	b, err := json.Marshal(body)
 	if err != nil {
-		return findNodeError(err, parent)
+		return marshalError(err)
+	}
+	err = teambition.jsonRequest(ctx, "PUT", fmt.Sprintf("https://pan.teambition.com/pan/api/nodes/%s", node.NodeId), bytes.NewBuffer(b), nil)
+	if err != nil {
+		return errors.Wrap(err, `error posting rename request`)
+	}
+	return nil
+}
+
+func (teambition *Teambition) Move(ctx context.Context, node *Node, newPath string) error {
+	if err := teambition.checkRoot(node); err != nil {
+		return err
+	}
+
+	newNode, err := teambition.Get(ctx, newPath, AnyKind)
+	if err != nil {
+		return findNodeError(err, newPath)
+	}
+	body := map[string]interface{}{
+		"orgId":     teambition.orgId,
+		"driveId":   teambition.driveId,
+		"sameLevel": false,
+		"ids": []map[string]string{
+			{
+				"id":        node.NodeId,
+				"ccpFileId": node.NodeId,
+			},
+		},
+		"parentId": newNode.NodeId,
+	}
+	b, err := json.Marshal(body)
+	if err != nil {
+		return marshalError(err)
+	}
+	err = teambition.jsonRequest(ctx, "POST", "https://pan.teambition.com/pan/api/nodes/move", bytes.NewBuffer(b), nil)
+	if err != nil {
+		return errors.Wrap(err, `error posting move request`)
+	}
+	return nil
+}
+
+func (teambition *Teambition) Remove(ctx context.Context, node *Node) error {
+	if err := teambition.checkRoot(node); err != nil {
+		return err
+	}
+
+	body := map[string]interface{}{
+		"nodeIds": []string{node.NodeId},
+		"orgId":   teambition.orgId,
+	}
+	b, err := json.Marshal(body)
+	if err != nil {
+		return marshalError(err)
+	}
+	err = teambition.jsonRequest(ctx, "POST", "https://pan.teambition.com/pan/api/nodes/archive", bytes.NewBuffer(b), nil)
+	if err != nil {
+		return errors.Wrap(err, `error posting remove request`)
+	}
+	return nil
+}
+
+func (teambition *Teambition) getByNode(ctx context.Context, node *Node) (*Node, error) {
+	var detail Node
+	err := teambition.jsonRequest(ctx, "GET", fmt.Sprintf("https://pan.teambition.com/pan/api/nodes/%s?orgId=%s&driveId=%s", node.NodeId, teambition.orgId, teambition.driveId), nil, &detail)
+	if err != nil {
+		return nil, errors.Wrapf(err, "error getting node detail, node: %s", node)
+	}
+	return &detail, nil
+}
+
+func (teambition *Teambition) Open(ctx context.Context, node *Node, headers map[string]string) (io.ReadCloser, error) {
+	if err := teambition.checkRoot(node); err != nil {
+		return nil, err
+	}
+
+	detail, err := teambition.getByNode(ctx, node)
+	if err != nil {
+		return nil, err
+	}
+
+	downloadUrl := detail.DownloadUrl
+	if downloadUrl == "" {
+		return nil, errors.Errorf(`error getting downloadUrl of "%s"`, node)
+	}
+
+	res, err := teambition.request(ctx, "GET", downloadUrl, headers, nil)
+	if err != nil {
+		return nil, errors.Wrapf(err, `error downloading "%s"`, downloadUrl)
+	}
+
+	return res.Body, nil
+}
+
+func (teambition *Teambition) CreateFile(ctx context.Context, path string, size int64, in io.Reader, overwrite bool) (*Node, error) {
+	path = normalizePath(path)
+	i := strings.LastIndex(path, "/")
+	parent := path[:i]
+	name := path[i+1:]
+	_, err := teambition.CreateFolder(ctx, parent)
+	if err != nil {
+		return nil, errors.New("error creating folder")
+	}
+
+	node, err := teambition.Get(ctx, parent, FolderKind)
+	if err != nil {
+		return nil, findNodeError(err, parent)
 	}
 
 	var uploadResults []UploadResult
-	{
+
+	preUpload := func() error {
 		body := map[string]interface{}{
 			"orgId":         teambition.orgId,
 			"spaceId":       teambition.rootId,
@@ -298,37 +461,53 @@ func (teambition *Teambition) CreateFile(ctx context.Context, parent string, nam
 			return marshalError(err)
 		}
 
-		res, err := teambition.request(ctx, "POST", "https://pan.teambition.com/pan/api/nodes/file", bytes.NewBuffer(b))
+		err = teambition.jsonRequest(ctx, "POST", "https://pan.teambition.com/pan/api/nodes/file", bytes.NewBuffer(b), &uploadResults)
 		if err != nil {
 			return errors.Wrap(err, `error posting create file request`)
-		}
-
-		err = json.NewDecoder(res.Body).Decode(&uploadResults)
-		if err != nil {
-			return decodeError(err)
 		}
 
 		if len(uploadResults) < 1 || len(uploadResults[0].UploadUrl) < 1 {
 			return errors.New(`error extracting uploadUrl'`)
 		}
-		defer res.Body.Close()
+
+		return nil
+	}
+
+	err = preUpload()
+	if err != nil {
+		return nil, err
+	}
+
+	uploadName := uploadResults[0].Name
+	if name != uploadName && overwrite {
+		node, err := teambition.Get(ctx, parent+"/"+name, FileKind)
+		if err == nil {
+			err = teambition.Remove(ctx, node)
+			if err == nil {
+				err = preUpload()
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
 	}
 
 	uploadUrl := uploadResults[0].UploadUrl[0]
 	{
 		req, err := http.NewRequestWithContext(ctx, "PUT", uploadUrl, in)
 		if err != nil {
-			return errors.Wrap(err, "error creating upload request")
+			return nil, errors.Wrap(err, "error creating upload request")
 		}
 		req.Header.Set("Content-Length", strconv.FormatInt(size, 10))
 		req.Header.Set("Content-Type", "")
 		ursp, err := teambition.httpClient.Do(req)
 		if err != nil {
-			return errors.Wrap(err, "error uploading file")
+			return nil, errors.Wrap(err, "error uploading file")
 		}
 		defer ursp.Body.Close()
 	}
 
+	var createdNode Node
 	{
 		body := map[string]interface{}{
 			"driveId":   teambition.driveId,
@@ -339,108 +518,13 @@ func (teambition *Teambition) CreateFile(ctx context.Context, parent string, nam
 		}
 		b, err := json.Marshal(body)
 		if err != nil {
-			return marshalError(err)
+			return nil, marshalError(err)
 		}
-		_, err = teambition.request(ctx, "POST", "https://pan.teambition.com/pan/api/nodes/complete", bytes.NewBuffer(b))
+
+		err = teambition.jsonRequest(ctx, "POST", "https://pan.teambition.com/pan/api/nodes/complete", bytes.NewBuffer(b), &createdNode)
 		if err != nil {
-			return errors.Wrap(err, `error posting upload complete request`)
+			return nil, errors.Wrap(err, `error posting upload complete request`)
 		}
 	}
-	return nil
-}
-
-func checkRoot(path string) error {
-	if path == "" || path == "/" {
-		return errors.New("can't operate on root ")
-	}
-	return nil
-}
-
-func (teambition *Teambition) Remove(ctx context.Context, path string) error {
-	if err := checkRoot(path); err != nil {
-		return err
-	}
-
-	node, err := teambition.findNode(ctx, path)
-	if err != nil {
-		return findNodeError(err, path)
-	}
-	body := map[string]interface{}{
-		"nodeIds": []string{node.NodeId},
-		"orgId":   teambition.orgId,
-	}
-	b, err := json.Marshal(body)
-	if err != nil {
-		return marshalError(err)
-	}
-	res, err := teambition.request(ctx, "POST", "https://pan.teambition.com/pan/api/nodes/archive", bytes.NewBuffer(b))
-	if err != nil {
-		return errors.Wrap(err, `error posting remove request`)
-	}
-	defer res.Body.Close()
-	return nil
-}
-
-func (teambition *Teambition) Rename(ctx context.Context, path string, newName string) error {
-	if err := checkRoot(path); err != nil {
-		return err
-	}
-
-	node, err := teambition.findNode(ctx, path)
-	if err != nil {
-		return findNodeError(err, path)
-	}
-	body := map[string]interface{}{
-		"orgId":     teambition.orgId,
-		"driveId":   teambition.driveId,
-		"ccpFileId": node.NodeId,
-		"name":      newName,
-	}
-	b, err := json.Marshal(body)
-	if err != nil {
-		return marshalError(err)
-	}
-	res, err := teambition.request(ctx, "PUT", fmt.Sprintf("https://pan.teambition.com/pan/api/nodes/%s", node.NodeId), bytes.NewBuffer(b))
-	if err != nil {
-		return errors.Wrap(err, `error posting rename request`)
-	}
-	defer res.Body.Close()
-	return nil
-}
-
-func (teambition *Teambition) Move(ctx context.Context, oldPath string, newPath string) error {
-	if err := checkRoot(oldPath); err != nil {
-		return err
-	}
-
-	oldNode, err := teambition.findNode(ctx, oldPath)
-	if err != nil {
-		return findNodeError(err, oldPath)
-	}
-	newNode, err := teambition.findNode(ctx, newPath)
-	if err != nil {
-		return findNodeError(err, newPath)
-	}
-	body := map[string]interface{}{
-		"orgId":     teambition.orgId,
-		"driveId":   teambition.driveId,
-		"sameLevel": false,
-		"ids": []map[string]string{
-			{
-				"id":        oldNode.NodeId,
-				"ccpFileId": oldNode.NodeId,
-			},
-		},
-		"parentId": newNode.NodeId,
-	}
-	b, err := json.Marshal(body)
-	if err != nil {
-		return marshalError(err)
-	}
-	res, err := teambition.request(ctx, "POST", "https://pan.teambition.com/pan/api/nodes/move", bytes.NewBuffer(b))
-	if err != nil {
-		return errors.Wrap(err, `error posting move request`)
-	}
-	defer res.Body.Close()
-	return nil
+	return &createdNode, nil
 }

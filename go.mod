@@ -1,4 +1,4 @@
-module github.com/K265/teambition-pan-api
+module teambition-pan-api
 
 go 1.14
 

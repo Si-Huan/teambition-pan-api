@@ -5,26 +5,31 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	errors "github.com/pkg/errors"
 	"io"
 	"io/ioutil"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
+
+	errors "github.com/pkg/errors"
 )
 
 var BaseUrl = "https://pan.teambition.com"
 
 type Fs interface {
 	Get(ctx context.Context, path string, kind string) (*Node, error)
+	GetbyNodeId(ctx context.Context, nodeId string) (*Node, error)
+	GetIn(ctx context.Context, node *Node, name string, kind string) (*Node, error)
 	List(ctx context.Context, path string) ([]Node, error)
 	CreateFolder(ctx context.Context, path string) (*Node, error)
+	CreateFolderIn(ctx context.Context, parent *Node, name string) (*Node, error)
 	Rename(ctx context.Context, node *Node, newName string) error
 	Move(ctx context.Context, node *Node, newPath string) error
 	Remove(ctx context.Context, node *Node) error
 	Open(ctx context.Context, node *Node, headers map[string]string) (io.ReadCloser, error)
 	CreateFile(ctx context.Context, path string, size int64, in io.Reader, overwrite bool) (*Node, error)
+	CreateFileIn(ctx context.Context, parent *Node, name string, size int64, in io.Reader, overwrite bool) (*Node, error)
 }
 
 type Config struct {
@@ -222,6 +227,20 @@ func (teambition *Teambition) Get(ctx context.Context, path string, kind string)
 	return teambition.findNameNode(ctx, &Node{NodeId: nodeId}, name, kind)
 }
 
+func (teambition *Teambition) GetbyNodeId(ctx context.Context, nodeId string) (*Node, error) {
+	format := "https://pan.teambition.com/pan/api/nodes/%s?orgId=%s&driveId=%s"
+	var node Node
+	err := teambition.jsonRequest(ctx, "GET", fmt.Sprintf(format, nodeId, teambition.orgId, teambition.driveId), nil, &node)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return &node, nil
+}
+
+func (teambition *Teambition) GetIn(ctx context.Context, parent *Node, name string, kind string) (*Node, error) {
+	return teambition.findNameNode(ctx, parent, name, kind)
+}
+
 func findNodeError(err error, path string) error {
 	return errors.Wrapf(err, `error finding node of "%s"`, path)
 }
@@ -258,13 +277,17 @@ func (teambition *Teambition) createFolderInternal(ctx context.Context, parent s
 	if err != nil {
 		return nil, findNodeError(err, parent)
 	}
+	return teambition.createFolderInNode(ctx, node, name)
+}
+
+func (teambition *Teambition) createFolderInNode(ctx context.Context, parent *Node, name string) (*Node, error) {
 	body := map[string]string{
-		"ccpParentId":   node.NodeId,
+		"ccpParentId":   parent.NodeId,
 		"checkNameMode": "refuse",
 		"driveId":       teambition.driveId,
 		"name":          name,
 		"orgId":         teambition.orgId,
-		"parentId":      node.NodeId,
+		"parentId":      parent.NodeId,
 		"spaceId":       teambition.rootId,
 		"type":          "folder",
 	}
@@ -303,6 +326,12 @@ func (teambition *Teambition) CreateFolder(ctx context.Context, path string) (*N
 	}
 
 	return createdNode, nil
+}
+
+func (teambition *Teambition) CreateFolderIn(ctx context.Context, parent *Node, name string) (*Node, error) {
+	teambition.mutex.Lock()
+	defer teambition.mutex.Unlock()
+	return teambition.createFolderInNode(ctx, parent, name)
 }
 
 func (teambition *Teambition) checkRoot(node *Node) error {
@@ -421,33 +450,19 @@ func (teambition *Teambition) Open(ctx context.Context, node *Node, headers map[
 	return res.Body, nil
 }
 
-func (teambition *Teambition) CreateFile(ctx context.Context, path string, size int64, in io.Reader, overwrite bool) (*Node, error) {
-	path = normalizePath(path)
-	i := strings.LastIndex(path, "/")
-	parent := path[:i]
-	name := path[i+1:]
-	_, err := teambition.CreateFolder(ctx, parent)
-	if err != nil {
-		return nil, errors.New("error creating folder")
-	}
-
-	node, err := teambition.Get(ctx, parent, FolderKind)
-	if err != nil {
-		return nil, findNodeError(err, parent)
-	}
-
+func (teambition *Teambition) createFileInNode(ctx context.Context, parent *Node, name string, size int64, in io.Reader, overwrite bool) (*Node, error) {
 	var uploadResults []UploadResult
 
 	preUpload := func() error {
 		body := map[string]interface{}{
 			"orgId":         teambition.orgId,
 			"spaceId":       teambition.rootId,
-			"parentId":      node.NodeId,
+			"parentId":      parent.NodeId,
 			"checkNameMode": "autoRename",
 			"infos": []map[string]interface{}{
 				{
 					"name":        name,
-					"ccpParentId": node.NodeId,
+					"ccpParentId": parent.NodeId,
 					"driveId":     teambition.driveId,
 					"size":        size,
 					"chunkCount":  1,
@@ -473,14 +488,14 @@ func (teambition *Teambition) CreateFile(ctx context.Context, path string, size 
 		return nil
 	}
 
-	err = preUpload()
+	err := preUpload()
 	if err != nil {
 		return nil, err
 	}
 
 	uploadName := uploadResults[0].Name
 	if name != uploadName && overwrite {
-		node, err := teambition.Get(ctx, parent+"/"+name, FileKind)
+		node, err := teambition.findNameNode(ctx, parent, name, FileKind)
 		if err == nil {
 			err = teambition.Remove(ctx, node)
 			if err == nil {
@@ -527,4 +542,25 @@ func (teambition *Teambition) CreateFile(ctx context.Context, path string, size 
 		}
 	}
 	return &createdNode, nil
+}
+
+func (teambition *Teambition) CreateFile(ctx context.Context, path string, size int64, in io.Reader, overwrite bool) (*Node, error) {
+	path = normalizePath(path)
+	i := strings.LastIndex(path, "/")
+	parent := path[:i]
+	name := path[i+1:]
+	_, err := teambition.CreateFolder(ctx, parent)
+	if err != nil {
+		return nil, errors.New("error creating folder")
+	}
+
+	node, err := teambition.Get(ctx, parent, FolderKind)
+	if err != nil {
+		return nil, findNodeError(err, parent)
+	}
+	return teambition.createFileInNode(ctx, node, name, size, in, overwrite)
+}
+
+func (teambition *Teambition) CreateFileIn(ctx context.Context, parent *Node, name string, size int64, in io.Reader, overwrite bool) (*Node, error) {
+	return teambition.createFileInNode(ctx, parent, name, size, in, overwrite)
 }

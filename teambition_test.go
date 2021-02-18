@@ -14,7 +14,7 @@ var fs Fs
 
 func setup(t *testing.T) context.Context {
 	cookie := ""
-	cb, err := ioutil.ReadFile("../../../../.cookie")
+	cb, err := ioutil.ReadFile(".cookie")
 	if err == nil {
 		cookie = string(cb)
 	}

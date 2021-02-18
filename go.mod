@@ -1,4 +1,4 @@
-module teambition-pan-api
+module github.com/Si-Huan/teambition-pan-api
 
 go 1.14
 

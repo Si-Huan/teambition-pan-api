@@ -39,7 +39,8 @@ func TestCreateFolder(t *testing.T) {
 	ctx := setup(t)
 	_, err := fs.CreateFolder(ctx, "/")
 	require.NoError(t, err)
-	_, err = fs.CreateFolder(ctx, "/test3/test4")
+	n, err := fs.CreateFolder(ctx, "/newFolder")
+	fmt.Println(n.NodeId)
 	require.NoError(t, err)
 }
 
@@ -93,6 +94,19 @@ func TestCreateFile(t *testing.T) {
 	info, err := fd.Stat()
 	require.NoError(t, err)
 	_, err = fs.CreateFile(ctx, "/media/1.mp3", info.Size(), fd, true)
+	require.NoError(t, err)
+	defer fd.Close()
+}
+
+func TestCreateFileIn(t *testing.T) {
+	ctx := setup(t)
+	fd, err := os.Open("cache.go")
+	require.NoError(t, err)
+	info, err := fd.Stat()
+	require.NoError(t, err)
+	node, err := fs.Get(ctx, "/test3", FolderKind)
+	n, err := fs.CreateFileIn(ctx, node, "1.txt", info.Size(), fd, true)
+	fmt.Println(n.NodeId)
 	require.NoError(t, err)
 	defer fd.Close()
 }

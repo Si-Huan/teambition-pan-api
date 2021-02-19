@@ -12,7 +12,7 @@ import (
 	"strings"
 	"sync"
 
-	errors "github.com/pkg/errors"
+	"github.com/pkg/errors"
 )
 
 var BaseUrl = "https://pan.teambition.com"
@@ -30,7 +30,7 @@ type Fs interface {
 	Open(ctx context.Context, node *Node, headers map[string]string) (io.ReadCloser, error)
 	CreateFile(ctx context.Context, path string, size int64, in io.Reader, overwrite bool) (*Node, error)
 	CreateFileIn(ctx context.Context, parent *Node, name string, size int64, in io.Reader, overwrite bool) (*Node, error)
-	Delete(ctx context.Context,node *Node) (error)
+	Delete(ctx context.Context, node *Node) error
 }
 
 type Config struct {
@@ -566,20 +566,20 @@ func (teambition *Teambition) CreateFileIn(ctx context.Context, parent *Node, na
 	return teambition.createFileInNode(ctx, parent, name, size, in, overwrite)
 }
 
-func (teambition *Teambition) Delete(ctx context.Context,node *Node)(error){
+func (teambition *Teambition) Delete(ctx context.Context, node *Node) error {
 	if err := teambition.checkRoot(node); err != nil {
 		return err
 	}
 
 	body := map[string]interface{}{
-		"driveId":   teambition.driveId,
+		"driveId": teambition.driveId,
 		"ids": []map[string]string{
 			{
 				"id":        node.NodeId,
 				"ccpFileId": node.NodeId,
 			},
 		},
-		"orgId":     teambition.orgId,
+		"orgId":   teambition.orgId,
 		"spaceId": teambition.rootId,
 	}
 	b, err := json.Marshal(body)

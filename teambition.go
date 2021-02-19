@@ -20,7 +20,7 @@ var BaseUrl = "https://pan.teambition.com"
 type Fs interface {
 	Get(ctx context.Context, path string, kind string) (*Node, error)
 	GetbyNodeId(ctx context.Context, nodeId string) (*Node, error)
-	GetIn(ctx context.Context, node *Node, name string, kind string) (*Node, error)
+	GetIn(ctx context.Context, parent *Node, name string, kind string) (*Node, error)
 	List(ctx context.Context, path string) ([]Node, error)
 	CreateFolder(ctx context.Context, path string) (*Node, error)
 	CreateFolderIn(ctx context.Context, parent *Node, name string) (*Node, error)
@@ -30,6 +30,7 @@ type Fs interface {
 	Open(ctx context.Context, node *Node, headers map[string]string) (io.ReadCloser, error)
 	CreateFile(ctx context.Context, path string, size int64, in io.Reader, overwrite bool) (*Node, error)
 	CreateFileIn(ctx context.Context, parent *Node, name string, size int64, in io.Reader, overwrite bool) (*Node, error)
+	Delete(ctx context.Context,node *Node) (error)
 }
 
 type Config struct {
@@ -563,4 +564,31 @@ func (teambition *Teambition) CreateFile(ctx context.Context, path string, size 
 
 func (teambition *Teambition) CreateFileIn(ctx context.Context, parent *Node, name string, size int64, in io.Reader, overwrite bool) (*Node, error) {
 	return teambition.createFileInNode(ctx, parent, name, size, in, overwrite)
+}
+
+func (teambition *Teambition) Delete(ctx context.Context,node *Node)(error){
+	if err := teambition.checkRoot(node); err != nil {
+		return err
+	}
+
+	body := map[string]interface{}{
+		"driveId":   teambition.driveId,
+		"ids": []map[string]string{
+			{
+				"id":        node.NodeId,
+				"ccpFileId": node.NodeId,
+			},
+		},
+		"orgId":     teambition.orgId,
+		"spaceId": teambition.rootId,
+	}
+	b, err := json.Marshal(body)
+	if err != nil {
+		return marshalError(err)
+	}
+	err = teambition.jsonRequest(ctx, "POST", "https://pan.teambition.com/pan/api/nodes/move", bytes.NewBuffer(b), nil)
+	if err != nil {
+		return errors.Wrap(err, `error posting delete request`)
+	}
+	return nil
 }

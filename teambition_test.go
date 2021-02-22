@@ -118,3 +118,11 @@ func TestIntegration1(t *testing.T) {
 	err = fs.Remove(ctx, node)
 	require.NoError(t, err)
 }
+
+func TestDelete(t *testing.T) {
+	ctx := setup(t)
+	node,err := fs.CreateFolder(ctx,"/test5")
+	require.NoError(t, err)
+	err = fs.Delete(ctx,node)
+	require.NoError(t, err)
+}

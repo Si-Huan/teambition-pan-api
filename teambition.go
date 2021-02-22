@@ -586,7 +586,7 @@ func (teambition *Teambition) Delete(ctx context.Context, node *Node) error {
 	if err != nil {
 		return marshalError(err)
 	}
-	err = teambition.jsonRequest(ctx, "POST", "https://pan.teambition.com/pan/api/nodes/move", bytes.NewBuffer(b), nil)
+	err = teambition.jsonRequest(ctx, "POST", "https://pan.teambition.com/pan/api/nodes/delete", bytes.NewBuffer(b), nil)
 	if err != nil {
 		return errors.Wrap(err, `error posting delete request`)
 	}

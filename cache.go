@@ -1,21 +1,20 @@
 package api
 
 import (
-	"fmt"
-
 	lru "github.com/hashicorp/golang-lru"
 )
 
-type Cache interface {
-	Get(string) (string, bool)
-	Put(string, string)
+type FolderCache interface {
+	Get(string) (*Node, bool)
+	Put(string, *Node)
+	Clear()
 }
 
 type CacheImpl struct {
 	cache *lru.Cache
 }
 
-func NewCache(size int) (Cache, error) {
+func NewCache(size int) (FolderCache, error) {
 	c, err := lru.New(size)
 	if err != nil {
 		return nil, err
@@ -23,11 +22,20 @@ func NewCache(size int) (Cache, error) {
 	return &CacheImpl{cache: c}, nil
 }
 
-func (c *CacheImpl) Get(key string) (string, bool) {
+func (c *CacheImpl) Get(key string) (*Node, bool) {
 	value, ok := c.cache.Get(key)
-	return fmt.Sprintf("%s", value), ok
+	if !ok {
+		return nil, ok
+	}
+
+	node, ok := value.(*Node)
+	return node, ok
 }
 
-func (c *CacheImpl) Put(key string, value string) {
-	c.cache.Add(key, value)
+func (c *CacheImpl) Put(key string, node *Node) {
+	c.cache.Add(key, node)
+}
+
+func (c *CacheImpl) Clear() {
+	c.cache.Purge()
 }
